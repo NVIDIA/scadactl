@@ -1,0 +1,4 @@
+packaging/scadactl usr/bin
+scripts/manage-scada-domains usr/sbin
+scadactl/*.py usr/lib/scada-tools/scadactl
+scadactl/backend/*.py usr/lib/scada-tools/scadactl/backend

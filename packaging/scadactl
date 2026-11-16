@@ -1,0 +1,21 @@
+#!/bin/sh
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Launcher for the scadactl Debian package.
+#
+# scadactl apply / scadactl policy are commonly run as root, so this launcher is
+# hardened against environment-based code injection when running as root:
+#   * absolute interpreter path  -- a hijacked PATH cannot substitute python3
+#   * isolated mode (-I)         -- inherited PYTHONPATH, PYTHONHOME, the current
+#                                   working directory, and the per-user site dir
+#                                   are all dropped from sys.path, so an
+#                                   attacker-controlled environment (or a hostile
+#                                   module planted in the CWD) cannot shadow a
+#                                   dependency such as `yaml` and execute as root
+#
+# The single packaged path is injected explicitly; the system site-packages
+# (python3-yaml) stay importable. Optional GPU bindings must be installed
+# system-wide (nvidia-ml-py) -- a per-user `pip install --user` is ignored under
+# isolated mode.
+exec /usr/bin/python3 -I -B -c 'import sys; sys.path.insert(0, "/usr/lib/scada-tools"); from scadactl.cli import main; sys.exit(main())' "$@"

@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scadactl"
+version = "0.6.0"
+description = "SCADA orchestration CLI: inventory, config, plan, apply, and client launch for GPU + NVMe hosts"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "NVIDIA" }]
+classifiers = [
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+]
+dependencies = [
+    "PyYAML",
+]
+
+[project.optional-dependencies]
+# The NVML bindings are imported lazily (as `import pynvml`) inside functions;
+# the package and hardware-free commands work without them. Install this extra
+# on hosts/containers that need the GPU-dependent commands (inventory, apply,
+# client ordinal mapping). nvidia-ml-py is NVIDIA's official binding and
+# provides the `pynvml` module; the separate `pynvml` shim is deprecated.
+gpu = ["nvidia-ml-py>=12"]
+dev = ["build", "pytest"]
+
+[project.scripts]
+scadactl = "scadactl.cli:main"
+
+[tool.setuptools]
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["scadactl*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

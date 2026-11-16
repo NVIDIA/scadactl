@@ -1,0 +1,27 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: scadactl
+
+Files: *
+Copyright: 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+License: Apache-2.0
+ On Debian systems, the complete text of the Apache License, Version 2.0,
+ is available in /usr/share/common-licenses/Apache-2.0.
+
+Files: CONTRIBUTING.md THIRD_PARTY_NOTICES.md
+Copyright: 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+           2004, 2006 The Linux Foundation and its contributors (DCO text)
+License: Apache-2.0 and DCO-1.1
+Comment: Apache-2.0 applies to the project contribution guidance and original
+ notice text. The embedded Developer Certificate of Origin and its reproduced
+ copyright/copying notice retain their own verbatim-copying terms.
+
+Files: CODE_OF_CONDUCT.md
+Copyright: Coraline Ada Ehmke and Contributor Covenant contributors
+           2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+License: CC-BY-4.0
+ License: https://creativecommons.org/licenses/by/4.0/
+ Legal code: https://creativecommons.org/licenses/by/4.0/legalcode
+
+License: DCO-1.1
+ Everyone is permitted to copy and distribute verbatim copies of this
+ license document, but changing it is not allowed.

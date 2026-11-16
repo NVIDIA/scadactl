@@ -1,0 +1,813 @@
+#!/usr/bin/env bash
+
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# manage-scada-domains — launch or stop scada-swap-domain per-GPU instances.
+#
+# Launch: maps each GPU index (nvidia-smi) to /dev/unvme* devices. Logs
+# (timestamped per launch):
+#   <log-dir>/scada-swap-domain.gpu<N>.<YYYYMMDD-HHMMSS>.log
+#
+# Stop: reads <log-dir>/scada-swap-domains.pidfile (per-PID /proc exe + starttime)
+# and signals only verified processes. Optional --force for pkill fallback.
+#
+# Requires: bash 4+
+# launch and stop must be run as root (e.g. sudo manage-scada-domains …) so
+# unvme devices can be opened, pidfiles are consistent, and domains can be stopped.
+#
+set -euo pipefail
+
+SCRIPT_TAG="[manage-scada-domains]"
+PIDFILE_NAME="scada-swap-domains.pidfile"
+STOP_WAIT_SEC="${STOP_WAIT_SEC:-15}"
+# Grace period to confirm a SIGKILLed process actually left the process table.
+STOP_KILL_WAIT_SEC="${STOP_KILL_WAIT_SEC:-5}"
+
+log_step() { echo "${SCRIPT_TAG} $*"; }
+warn() { echo "warning: ${SCRIPT_TAG} $*" >&2; }
+# Yellow on stderr when interactive (avoid escape codes in captured logs).
+warn_yellow() {
+  if [[ -t 2 ]]; then
+    printf '\033[1;33mwarning: %s %s\033[0m\n' "${SCRIPT_TAG}" "$*" >&2
+  else
+    printf 'warning: %s %s\n' "${SCRIPT_TAG}" "$*" >&2
+  fi
+}
+die() {
+  echo "error: ${SCRIPT_TAG} $*" >&2
+  exit 1
+}
+
+# /proc identity for pidfile stop verification (avoid killing recycled unrelated PIDs).
+proc_exe_resolved() {
+  local pid=$1
+  readlink -f "/proc/${pid}/exe" 2>/dev/null || true
+}
+
+proc_starttime_ticks() {
+  local pid=$1
+  sed -n 's/.*) //p' "/proc/${pid}/stat" 2>/dev/null | awk '{print $20}'
+}
+
+verify_pid_matches_identity() {
+  local pid=$1 expected_exe=$2 expected_start=$3
+  local cur_exe cur_start
+
+  if ! kill -0 "$pid" 2>/dev/null; then
+    warn "PID $pid not running; skipping"
+    return 1
+  fi
+  cur_exe=$(proc_exe_resolved "$pid")
+  cur_start=$(proc_starttime_ticks "$pid")
+  if [[ -z "$cur_exe" || -z "$cur_start" ]]; then
+    warn "PID $pid: cannot read /proc/$pid identity; skipping"
+    return 1
+  fi
+  if [[ "$cur_exe" != "$expected_exe" ]]; then
+    warn "PID $pid: exe mismatch (pidfile: $(printf %q "$expected_exe"), now: $(printf %q "$cur_exe")); skipping"
+    return 1
+  fi
+  if [[ "$cur_start" != "$expected_start" ]]; then
+    warn "PID $pid: start time mismatch (pid likely reused); skipping"
+    return 1
+  fi
+  return 0
+}
+
+resolve_domain_binary() {
+  local label=$1 binary=$2
+  if [[ "$binary" == */* ]]; then
+    [[ -f "$binary" && -x "$binary" ]] || die "${label}: not executable: $binary"
+    readlink -f "$binary"
+  else
+    local found
+    found=$(command -v -- "$binary" 2>/dev/null) ||
+      die "${label}: domain binary not on PATH: $binary"
+    readlink -f "$found"
+  fi
+}
+
+# Run pkill -f; return 0 if any process matched, 1 if none, 2 on error (safe with set -e).
+pkill_force_match() {
+  local sig=$1 pattern=$2
+  if pkill "$sig" -f "$pattern"; then
+    return 0
+  fi
+  local rc=$?
+  [[ "$rc" -eq 1 ]] && return 1
+  warn "stop: pkill -${sig} -f failed (exit ${rc}) for pattern $(printf %q "$pattern")"
+  return 2
+}
+
+# Canonicalize --log-dir without aborting under set -e when the path tree is missing.
+resolve_log_dir() {
+  local subcmd=$1 log_dir=$2
+  if [[ -d "$log_dir" ]] || [[ -e "$log_dir" ]]; then
+    local resolved=""
+    if resolved=$(readlink -f "$log_dir" 2>/dev/null) && [[ -n "$resolved" ]]; then
+      printf '%s' "$resolved"
+      return 0
+    fi
+  fi
+  if command -v realpath >/dev/null 2>&1; then
+    local resolved=""
+    if resolved=$(realpath -m "$log_dir" 2>/dev/null) && [[ -n "$resolved" ]]; then
+      printf '%s' "$resolved"
+      return 0
+    fi
+  fi
+  warn "${subcmd}: could not canonicalize --log-dir $(printf %q "$log_dir"); using path as given"
+  printf '%s' "$log_dir"
+}
+
+# After option parsing, launch/stop call this so `… --help` still works without root.
+require_root() {
+  local subcmd=$1
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    {
+      echo "error: ${SCRIPT_TAG} ${subcmd}: this command must be run with sudo (as root)."
+      echo "error: ${SCRIPT_TAG} Re-run exactly: sudo $0 ${subcmd} … (your user stays in the environment; the script needs root)."
+      echo "error: ${SCRIPT_TAG} Root is required because this script:"
+      echo "error: ${SCRIPT_TAG}   - launch: launches scada-swap-domain that requires sudo to open /dev/unvme*"
+      echo "error: ${SCRIPT_TAG}   - stop:  reads the pidfile written by launch and that happens as sudo"
+    } >&2
+    exit 1
+  fi
+}
+
+# Every GPU index listed in the config must appear in `nvidia-smi --query-gpu=index`.
+validate_config_gpu_indices_exist_on_host() {
+  command -v nvidia-smi >/dev/null 2>&1 ||
+    die "launch: nvidia-smi not found on PATH; cannot verify GPU indices against this machine."
+
+  local -a smi_idx=()
+  local raw
+  while IFS= read -r raw || [[ -n "$raw" ]]; do
+    raw="${raw// /}"
+    raw="${raw//$'\r'/}"
+    [[ -z "$raw" ]] && continue
+    [[ "$raw" =~ ^[0-9]+$ ]] || die "launch: nvidia-smi returned a non-integer GPU index: $(printf %q "$raw")"
+    smi_idx+=("$((10#${raw}))")
+  done < <(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null)
+
+  ((${#smi_idx[@]} > 0)) || die "launch: nvidia-smi reported zero GPUs (no visible NVIDIA GPU, driver issue, or query failed). Run nvidia-smi manually."
+
+  declare -A present=()
+  for raw in "${smi_idx[@]}"; do
+    present["$raw"]=1
+  done
+
+  local k kk
+  for k in "${!GPU_DEVLIST[@]}"; do
+    [[ "$k" =~ ^[0-9]+$ ]] || die "launch: internal error: non-integer GPU key $(printf %q "$k")"
+    kk=$((10#${k}))
+    [[ -n "${present[$kk]-}" ]] || die "launch: config uses GPU index ${kk}, but nvidia-smi only reports: ${smi_idx[*]} (${#smi_idx[@]} GPU(s)). Each config index must match a GPU index from nvidia-smi."
+  done
+  log_step "[preflight] GPU indices in config are present on host (nvidia-smi): ${smi_idx[*]}"
+}
+
+usage() {
+  cat <<'EOF'
+Usage (invoke launch and stop as root, e.g. sudo …):
+  sudo manage-scada-domains launch --config FILE --log-dir DIR [LAUNCH_OPTIONS]
+  sudo manage-scada-domains stop --log-dir DIR [STOP_OPTIONS]
+
+Subcommands
+-----------
+  launch    Start one scada-swap-domain per GPU (background). Writes a pidfile
+            under --log-dir for a later matching "stop". Must be run as root.
+  stop      Stop domains launched from this script for the same --log-dir
+            (reads the pidfile). Use --force only if the pidfile is missing.
+            Must be run as root.
+
+Launch options
+--------------
+  --config FILE        Required. Absolute path to the GPU→unvme mapping file.
+  --log-dir DIR        Required. Absolute directory for logs, pidfile, and (with
+                       --local-socket) domain working directory. Use a path that
+                       is NOT erased by "make clean" / CMake clean (e.g. not only
+                       the build tree), or "stop" will not find the pidfile.
+  --gpus LIST          Optional. Comma-separated GPU indices (subset of config).
+  --domain-binary PATH Executable. Default: scada-swap-domain (PATH or absolute).
+  --storage-backend B  Device token contract: kernel (default) or lender.
+  --local-socket       Pass --local-socket to each domain.
+  --group NAME         Optional. UNIX group to own each domain's socket (mode 0660),
+                       forwarded to scada-swap-domain --group. Default: root-owned.
+  --profiler-socket PATH
+                       Profiler Unix socket forwarded to one domain as
+                       scada-swap-domain --profiler-socket. Requires exactly one
+                       selected GPU so one path cannot be shared accidentally.
+  --dry-run            Print commands only; do not start servers or write pidfile.
+                       (Preflight device checks are skipped in dry-run.)
+                       Launch checks GPU column vs nvidia-smi (needs nvidia-smi on PATH).
+                       Kernel launches need fuser(1) (e.g. psmisc) to refuse a
+                       second launch while /dev/unvme* for that GPU is still in use.
+
+Stop options
+------------
+  --log-dir DIR        Required. Same absolute path used for "launch".
+  --force              If no pidfile, run pkill -f on the resolved domain binary path
+                       (full command-line match; broader than -x). Use only when needed.
+  --domain-binary PATH Executable matched by --force (default: scada-swap-domain).
+
+  -h, --help           This help
+
+Config file format (launch)
+----------------------------
+  Lines:   <gpu_index>  <device> [<device> ...]
+  gpu_index: non-negative decimal integer, must match nvidia-smi --query-gpu=index.
+  kernel devices are /dev/unvme* character devices; lender devices are PCI BDFs
+  such as 0000:3c:00.0. Each device may appear on only one GPU line.
+  Empty lines and lines starting with # are ignored.
+
+EOF
+}
+
+cmd_launch() {
+  local CONFIG_FILE="" GPUS_FILTER="" DOMAIN_BINARY="scada-swap-domain" LOG_DIR=""
+  local STORAGE_BACKEND="kernel"
+  local LOCAL_SOCKET=0 DRY_RUN=0 SOCKET_GROUP="" PROFILER_SOCKET=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+    --config)
+      [[ $# -ge 2 ]] || die "launch: --config requires a value"
+      CONFIG_FILE="$2"
+      shift 2
+      ;;
+    --gpus)
+      [[ $# -ge 2 ]] || die "launch: --gpus requires a value"
+      GPUS_FILTER="$2"
+      shift 2
+      ;;
+    --domain-binary)
+      [[ $# -ge 2 ]] || die "launch: --domain-binary requires a value"
+      DOMAIN_BINARY="$2"
+      shift 2
+      ;;
+    --storage-backend)
+      [[ $# -ge 2 ]] || die "launch: --storage-backend requires a value"
+      STORAGE_BACKEND="$2"
+      shift 2
+      ;;
+    --log-dir)
+      [[ $# -ge 2 ]] || die "launch: --log-dir requires a value"
+      LOG_DIR="$2"
+      shift 2
+      ;;
+    --local-socket)
+      LOCAL_SOCKET=1
+      shift
+      ;;
+    --group)
+      [[ $# -ge 2 ]] || die "launch: --group requires a value"
+      SOCKET_GROUP="$2"
+      shift 2
+      ;;
+    --profiler-socket)
+      [[ $# -ge 2 ]] || die "launch: --profiler-socket requires a value"
+      PROFILER_SOCKET="$2"
+      shift 2
+      ;;
+    --sudo) die "launch: --sudo is not supported; run the whole script as root (sudo $0 launch …)." ;;
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *) die "launch: unknown option: $1" ;;
+    esac
+  done
+
+  require_root launch
+
+  [[ "$STORAGE_BACKEND" == "kernel" || "$STORAGE_BACKEND" == "lender" ]] ||
+    die "launch: --storage-backend must be kernel or lender (got: $STORAGE_BACKEND)"
+
+  [[ -n "$CONFIG_FILE" ]] || {
+    usage >&2
+    die "launch: missing --config FILE"
+  }
+  [[ "$CONFIG_FILE" == /* ]] || die "launch: --config must be absolute (got: $CONFIG_FILE)"
+  [[ -f "$CONFIG_FILE" ]] || die "launch: config not found: $CONFIG_FILE"
+
+  [[ -n "$LOG_DIR" ]] || {
+    usage >&2
+    die "launch: missing --log-dir DIR"
+  }
+  [[ "$LOG_DIR" == /* ]] || die "launch: --log-dir must be absolute (got: $LOG_DIR)"
+
+  if [[ -n "$PROFILER_SOCKET" ]]; then
+    [[ "$PROFILER_SOCKET" == /* ]] || die "launch: --profiler-socket must be absolute (got: $PROFILER_SOCKET)"
+  fi
+
+  log_step "=== Reading config: $CONFIG_FILE ==="
+
+  declare -A GPU_DEVLIST=()
+  declare -A DEV_ASSIGNED_GPU=()
+  local line_no=0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    ((line_no++)) || true
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+    line="${line%%#*}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -z "$line" ]] && continue
+
+    read -r -a _toks <<<"$line"
+    ((${#_toks[@]} >= 2)) || die "launch: line $line_no: need GPU index and at least one device"
+    local _gpu="${_toks[0]}"
+    [[ "$_gpu" =~ ^[0-9]+$ ]] || die "launch: line $line_no: GPU index must be a non-negative decimal integer (got: $(printf %q "$_gpu"))"
+    _gpu=$((10#${_gpu}))
+    local _devs=("${_toks[@]:1}")
+    [[ -z "${GPU_DEVLIST[$_gpu]-}" ]] || die "launch: line $line_no: duplicate GPU index $_gpu"
+    for _d in "${_devs[@]}"; do
+      if [[ "$STORAGE_BACKEND" == "kernel" ]]; then
+        [[ "$_d" == /dev/unvme* ]] ||
+          die "launch: line $line_no: device $(printf %q "$_d") must be a /dev/unvme* path"
+        [[ -c "$_d" ]] ||
+          die "launch: line $line_no: device $(printf %q "$_d") is not a character device (or does not exist)"
+      else
+        [[ "$_d" =~ ^[[:xdigit:]]{4}:[[:xdigit:]]{2}:[[:xdigit:]]{2}\.[0-7]$ ]] ||
+          die "launch: line $line_no: device $(printf %q "$_d") must be a PCI BDF (e.g. 0000:3c:00.0)"
+      fi
+      if [[ -n "${DEV_ASSIGNED_GPU[$_d]-}" ]]; then
+        die "launch: line $line_no: device $_d already assigned to GPU ${DEV_ASSIGNED_GPU[$_d]} (cannot also assign to GPU $_gpu)"
+      fi
+      DEV_ASSIGNED_GPU["$_d"]="$_gpu"
+    done
+    GPU_DEVLIST["$_gpu"]="${_devs[*]}"
+    log_step "[config] GPU $_gpu -> ${_devs[*]}"
+  done <"$CONFIG_FILE"
+
+  ((${#GPU_DEVLIST[@]} > 0)) || die "launch: no GPU mappings in config"
+
+  validate_config_gpu_indices_exist_on_host
+
+  log_step "=== Selecting GPUs ==="
+  declare -a GPU_INDICES=()
+  if [[ -z "$GPUS_FILTER" ]]; then
+    mapfile -t GPU_INDICES < <(printf '%s\n' "${!GPU_DEVLIST[@]}" | sort -n)
+  else
+    IFS=',' read -ra _parts <<<"$GPUS_FILTER"
+    declare -A _seen_filter=()
+    for p in "${_parts[@]}"; do
+      local g="${p// /}"
+      [[ -n "$g" ]] || continue
+      [[ "$g" =~ ^[0-9]+$ ]] || die "launch: --gpus: each index must be a non-negative decimal integer (got: $(printf %q "$g"))"
+      g=$((10#${g}))
+      [[ -n "${GPU_DEVLIST[$g]-}" ]] || die "launch: --gpus: GPU $g not in config"
+      [[ -z "${_seen_filter[$g]-}" ]] || continue
+      _seen_filter["$g"]=1
+      GPU_INDICES+=("$g")
+    done
+    ((${#GPU_INDICES[@]} > 0)) || die "launch: --gpus: empty list"
+    mapfile -t GPU_INDICES < <(printf '%s\n' "${GPU_INDICES[@]}" | sort -n)
+  fi
+  log_step "[launch list] GPU indices: ${GPU_INDICES[*]}"
+
+  if [[ -n "$PROFILER_SOCKET" && ${#GPU_INDICES[@]} -ne 1 ]]; then
+    die "launch: --profiler-socket requires exactly one selected GPU; refusing to share one profiler endpoint"
+  fi
+
+  log_step "=== Resolve domain binary ==="
+  local DOMAIN_RESOLVED
+  DOMAIN_RESOLVED=$(resolve_domain_binary launch "$DOMAIN_BINARY")
+  log_step "[launch] Domain executable: $DOMAIN_RESOLVED"
+
+  mkdir -p "$LOG_DIR"
+  local LOG_RESOLVED
+  LOG_RESOLVED=$(resolve_log_dir launch "$LOG_DIR")
+  log_step "[launch] Log directory: $LOG_RESOLVED"
+
+  # Per-launch timestamp: each run writes its own log file so successive runs
+  # of the same domain never co-mingle in one file.
+  local STAMP
+  STAMP=$(date +%Y%m%d-%H%M%S)
+
+  local pidfile="${LOG_RESOLVED}/${PIDFILE_NAME}"
+  local EXTRA_ARGS=()
+  [[ "$LOCAL_SOCKET" -eq 1 ]] && EXTRA_ARGS+=(--local-socket)
+  # Forward the socket-owner group to each domain (server sets a group-owned,
+  # mode-0660 socket so unprivileged clients in that group can connect).
+  [[ -n "$SOCKET_GROUP" ]] && EXTRA_ARGS+=(--group "$SOCKET_GROUP")
+  [[ -n "$PROFILER_SOCKET" ]] && EXTRA_ARGS+=(--profiler-socket "$PROFILER_SOCKET")
+
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    log_step "[launch] Dry-run: no processes started; pidfile not written."
+    for _g in "${GPU_INDICES[@]}"; do
+      read -r -a DEV_ARR <<<"${GPU_DEVLIST[$_g]}"
+      log_step "[launch]   would run: env CUDA_VISIBLE_DEVICES=$_g $DOMAIN_RESOLVED ${EXTRA_ARGS[*]:-} ${DEV_ARR[*]}"
+    done
+    log_step "Done."
+    return 0
+  fi
+
+  # Log files are timestamped per launch (scada-swap-domain.gpu<N>.<STAMP>.log),
+  # so each run gets a fresh file and runs never co-mingle.
+  local _g
+
+  if [[ "$STORAGE_BACKEND" == "kernel" ]]; then
+    log_step "=== Preflight: at most one scada-swap-domain per GPU (exclusive /dev/unvme*) ==="
+    command -v fuser >/dev/null 2>&1 ||
+      die "launch: fuser(1) not found (install the package that provides it, e.g. psmisc). Without it we cannot verify devices are free — refusing to launch."
+
+    for _g in "${GPU_INDICES[@]}"; do
+      read -r -a DEV_ARR <<<"${GPU_DEVLIST[$_g]}"
+      for _d in "${DEV_ARR[@]}"; do
+        if fuser -s "$_d" 2>/dev/null; then
+        {
+          echo "error: ${SCRIPT_TAG} launch: device ${_d} (GPU ${_g}) is already in use."
+          echo "error: ${SCRIPT_TAG} Only one scada-swap-domain may use a GPU's unvme devices at a time; a second launch on the same GPU is not allowed."
+          echo "error: ${SCRIPT_TAG} Stop the existing domain first, then retry, e.g.:"
+          echo "error: ${SCRIPT_TAG}   sudo $0 stop --log-dir ${LOG_RESOLVED}"
+          echo "error: ${SCRIPT_TAG} Inspect who holds the device: fuser -v ${_d}"
+        } >&2
+        exit 1
+        fi
+      done
+      log_step "[preflight] GPU ${_g}: devices free (${DEV_ARR[*]})"
+    done
+  else
+    log_step "[preflight] Storage Lender BDFs accepted optimistically; service ownership is not queryable."
+  fi
+
+  declare -a STARTED_GPU=()
+  declare -a STARTED_PID=()
+
+  log_step "=== Launch scada-swap-domain (pidfile only after all domains stay up) ==="
+
+  for _g in "${GPU_INDICES[@]}"; do
+    read -r -a DEV_ARR <<<"${GPU_DEVLIST[$_g]}"
+    local _log_file="${LOG_RESOLVED}/scada-swap-domain.gpu${_g}.${STAMP}.log"
+    log_step "[launch] GPU $_g  CUDA_VISIBLE_DEVICES=$_g  devices: ${DEV_ARR[*]}"
+    log_step "[launch]   log file: $_log_file"
+
+    (
+      cd "$LOG_RESOLVED" || exit 1
+      export CUDA_VISIBLE_DEVICES="$_g"
+      exec "$DOMAIN_RESOLVED" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} "${DEV_ARR[@]}"
+    ) >>"$_log_file" 2>&1 &
+    local launcher_pid=$!
+    STARTED_GPU+=("$_g")
+    STARTED_PID+=("$launcher_pid")
+    log_step "[launch]   started background pid: $launcher_pid (gpu ${_g})"
+  done
+
+  log_step "[launch] waiting briefly to confirm each domain process is still running…"
+  sleep 1
+
+  declare -a DEAD_GPUS=()
+  local i
+  for i in "${!STARTED_PID[@]}"; do
+    if ! kill -0 "${STARTED_PID[i]}" 2>/dev/null; then
+      DEAD_GPUS+=("${STARTED_GPU[i]}")
+    fi
+  done
+
+  if ((${#DEAD_GPUS[@]} > 0)); then
+    log_step "[launch] one or more domains exited immediately; cleaning up this launch attempt…"
+    for i in "${!STARTED_PID[@]}"; do
+      kill -TERM "${STARTED_PID[i]}" 2>/dev/null || true
+    done
+    sleep 1
+    for i in "${!STARTED_PID[@]}"; do
+      kill -KILL "${STARTED_PID[i]}" 2>/dev/null || true
+    done
+    rm -f "$pidfile"
+    {
+      echo "error: ${SCRIPT_TAG} launch: domain(s) for GPU(s) ${DEAD_GPUS[*]} exited right after start (process no longer running)."
+      echo "error: ${SCRIPT_TAG} This is not a silent failure: no pidfile was written; other GPUs from this attempt were signaled to stop."
+      echo "error: ${SCRIPT_TAG} Read the per-GPU logs under: ${LOG_RESOLVED}/scada-swap-domain.gpu*.log"
+      echo "error: ${SCRIPT_TAG} Fix the reported error (devices, permissions, env), then run again with: sudo $0 launch …"
+    } >&2
+    exit 1
+  fi
+
+  # The domains are RUNNING from here on, but are not yet recorded anywhere. Any
+  # failure to persist the pidfile must therefore stop them: without a complete
+  # pidfile no later "stop --log-dir" can find these processes, so aborting bare
+  # would orphan live servers holding /dev/unvme* devices. Success is reported
+  # only once the pidfile is fully written.
+  if ! : >"$pidfile" 2>/dev/null; then
+    kill_started_launch
+    die "launch: cannot create pidfile $pidfile (stopped this attempt's domains)"
+  fi
+  if ! {
+    echo "# scada-swap-domains pidfile (managed by manage-scada-domains)"
+    echo "# Per-GPU rows: gpu<TAB>pid<TAB>exe<TAB>starttime_ticks"
+    echo "DOMAIN_RESOLVED=${DOMAIN_RESOLVED}"
+    echo "USE_SUDO=0"
+  } >>"$pidfile" 2>/dev/null; then
+    kill_started_launch
+    rm -f "$pidfile"
+    die "launch: cannot write pidfile header to $pidfile (stopped this attempt's domains)"
+  fi
+  for i in "${!STARTED_PID[@]}"; do
+    local _pid="${STARTED_PID[i]}"
+    local _exe _start
+    _exe=$(proc_exe_resolved "$_pid" || true)
+    _start=$(proc_starttime_ticks "$_pid" || true)
+    if [[ -z "$_exe" || -z "$_start" ]]; then
+      kill_started_launch
+      rm -f "$pidfile"
+      die "launch: cannot read /proc/${_pid} identity for pidfile (gpu ${STARTED_GPU[i]}); stopped this attempt's domains to avoid orphaning them"
+    fi
+    if ! printf '%s\t%s\t%s\t%s\n' "${STARTED_GPU[i]}" "$_pid" "$_exe" "$_start" >>"$pidfile" 2>/dev/null; then
+      kill_started_launch
+      rm -f "$pidfile"
+      die "launch: cannot append PID row for gpu ${STARTED_GPU[i]} to $pidfile (stopped this attempt's domains)"
+    fi
+  done
+
+  log_step "Done. All domains running; pidfile written: $pidfile"
+}
+
+kill_one_pid() {
+  local pid=$1
+  if ! kill -0 "$pid" 2>/dev/null; then
+    warn "PID $pid not running; skipping"
+    return 0
+  fi
+  kill -TERM "$pid" 2>/dev/null || true
+}
+
+kill_one_pid_force() {
+  local pid=$1
+  kill -0 "$pid" 2>/dev/null || return 0
+  kill -KILL "$pid" 2>/dev/null || true
+}
+
+# Stop the domains started by THIS launch attempt (SIGTERM, then SIGKILL).
+# Used when a post-launch step fails: the servers are already running, so
+# aborting without stopping them would orphan live processes holding /dev/unvme*
+# that no later "stop --log-dir" could find (its pidfile was never completed).
+# Reads cmd_launch's STARTED_PID/STARTED_GPU via bash dynamic scoping.
+kill_started_launch() {
+  local i
+  ((${#STARTED_PID[@]} > 0)) || return 0
+  warn "launch: stopping the ${#STARTED_PID[@]} domain(s) started by this attempt to avoid orphaning them"
+  for i in "${!STARTED_PID[@]}"; do
+    kill -TERM "${STARTED_PID[i]}" 2>/dev/null || true
+  done
+  sleep 2
+  for i in "${!STARTED_PID[@]}"; do
+    kill -KILL "${STARTED_PID[i]}" 2>/dev/null || true
+  done
+}
+
+cmd_stop() {
+  local LOG_DIR="" FORCE=0 DOMAIN_BINARY="scada-swap-domain"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+    --log-dir)
+      [[ $# -ge 2 ]] || die "stop: --log-dir requires a value"
+      LOG_DIR="$2"
+      shift 2
+      ;;
+    --sudo) die "stop: --sudo is not supported; run the whole script as root (sudo $0 stop …)." ;;
+    --force)
+      FORCE=1
+      shift
+      ;;
+    --domain-binary)
+      [[ $# -ge 2 ]] || die "stop: --domain-binary requires a value"
+      DOMAIN_BINARY="$2"
+      shift 2
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *) die "stop: unknown option: $1" ;;
+    esac
+  done
+
+  require_root stop
+
+  [[ -n "$LOG_DIR" ]] || {
+    usage >&2
+    die "stop: missing --log-dir DIR"
+  }
+  [[ "$LOG_DIR" == /* ]] || die "stop: --log-dir must be absolute (got: $LOG_DIR)"
+
+  local LOG_RESOLVED
+  LOG_RESOLVED=$(resolve_log_dir stop "$LOG_DIR")
+  local pidfile="${LOG_RESOLVED}/${PIDFILE_NAME}"
+
+  if [[ ! -f "$pidfile" ]]; then
+    if [[ "$FORCE" -ne 1 ]]; then
+      {
+        echo "error: ${SCRIPT_TAG} stop: no pidfile at $pidfile — cannot send targeted SIGTERM."
+        echo "error: ${SCRIPT_TAG} Common causes:"
+        echo "error: ${SCRIPT_TAG}   (1) This --log-dir was wiped (e.g. make clean on a build directory) while scada-swap-domain is still running."
+        echo "error: ${SCRIPT_TAG}   (2) Different --log-dir than at launch."
+        echo "error: ${SCRIPT_TAG}   (3) Launch was never done with this script (or not with this --log-dir)."
+        echo "error: ${SCRIPT_TAG} If domains are still running but the pidfile is missing, same --log-dir (as root) and:"
+        echo "error: ${SCRIPT_TAG}   sudo $0 stop --log-dir DIR --force"
+        echo "error: ${SCRIPT_TAG} (narrow with --domain-binary if needed). See --help."
+      } >&2
+      exit 1
+    fi
+    local DOMAIN_RESOLVED_STOP
+    DOMAIN_RESOLVED_STOP=$(resolve_domain_binary stop "$DOMAIN_BINARY")
+    local _pkill_pattern="${DOMAIN_RESOLVED_STOP}"
+    warn "stop: no pidfile; --force: pkill -f on command line matching $(printf %q "$_pkill_pattern")"
+
+    local term_rc kill_rc
+    term_rc=0
+    if ! pkill_force_match TERM "$_pkill_pattern"; then
+      term_rc=$?
+    fi
+    sleep 2
+    kill_rc=0
+    if ! pkill_force_match KILL "$_pkill_pattern"; then
+      kill_rc=$?
+    fi
+
+    if [[ "$term_rc" -eq 0 || "$kill_rc" -eq 0 ]]; then
+      log_step "stop: --force signaled matching domain process(es): $_pkill_pattern"
+    elif [[ "$term_rc" -eq 1 && "$kill_rc" -eq 1 ]]; then
+      warn "stop: --force: no running processes matched $(printf %q "$_pkill_pattern")"
+      warn "stop: Manual cleanup if needed:"
+      warn "stop:   (1) Remove pidfile: ${LOG_RESOLVED}/${PIDFILE_NAME}"
+      warn "stop:   (2) Remove or archive logs: ${LOG_RESOLVED}/scada-swap-domain.gpu*.log"
+      warn "stop:   (3) If scada-swap-domain is still running, find PIDs:"
+      warn "stop:         ps aux | grep scada-swap-domain"
+      warn "stop:       then stop each process: kill <PID>  (or kill -9 <PID> if it does not exit)"
+    else
+      warn "stop: --force: incomplete (pkill TERM exit ${term_rc}, KILL exit ${kill_rc})"
+    fi
+    return 0
+  fi
+
+  log_step "=== Stop from pidfile: $pidfile ==="
+
+  local DOMAIN_RESOLVED_STOP
+  DOMAIN_RESOLVED_STOP=$(resolve_domain_binary stop "$DOMAIN_BINARY")
+
+  local PIDFILE_DOMAIN=""
+  declare -a PENDING_PID=() PENDING_EXE=() PENDING_START=()
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+    [[ -z "${line// /}" ]] && continue
+    if [[ "$line" =~ ^DOMAIN_RESOLVED=(.*)$ ]]; then
+      PIDFILE_DOMAIN="${BASH_REMATCH[1]}"
+      continue
+    fi
+    if [[ "$line" =~ ^USE_SUDO= ]]; then
+      continue
+    fi
+    if [[ "$line" == *$'\t'* ]]; then
+      local _gpu _pid _exe _start
+      IFS=$'\t' read -r _gpu _pid _exe _start <<<"$line"
+      [[ "$_pid" =~ ^[0-9]+$ ]] || continue
+      PENDING_PID+=("$_pid")
+      PENDING_EXE+=("$_exe")
+      PENDING_START+=("$_start")
+      continue
+    fi
+    warn "stop: ignoring unrecognized pidfile line: $(printf %q "$line")"
+  done <"$pidfile"
+
+  [[ -n "$PIDFILE_DOMAIN" ]] || die "stop: pidfile missing DOMAIN_RESOLVED= (re-run launch)"
+
+  if [[ "$PIDFILE_DOMAIN" != "$DOMAIN_RESOLVED_STOP" ]]; then
+    die "stop: pidfile DOMAIN_RESOLVED=${PIDFILE_DOMAIN} does not match --domain-binary (${DOMAIN_RESOLVED_STOP})"
+  fi
+
+  declare -a STOP_PIDS=()
+  # PIDs that are STILL RUNNING but could not be identity-verified. These are not
+  # safe to forget: "skipping" covers an unreadable /proc, a start-time mismatch,
+  # and an exe mismatch (which happens to every live domain after the
+  # scada-swap-domain package is upgraded in place, since /proc/PID/exe then reads
+  # "<path> (deleted)"). Dropping the pidfile for these would report a successful
+  # stop while the server is alive -- and the orchestrator would then release its
+  # drives out from under it.
+  declare -a UNVERIFIED_LIVE=()
+  local i
+  for i in "${!PENDING_PID[@]}"; do
+    local _pid="${PENDING_PID[i]}"
+    local _exe="${PENDING_EXE[i]}"
+    local _start="${PENDING_START[i]}"
+    if [[ -n "$PIDFILE_DOMAIN" && "$_exe" != "$PIDFILE_DOMAIN" ]]; then
+      warn "PID $_pid: pidfile line exe $(printf %q "$_exe") != DOMAIN_RESOLVED $(printf %q "$PIDFILE_DOMAIN"); skipping"
+      kill -0 "$_pid" 2>/dev/null && UNVERIFIED_LIVE+=("$_pid")
+      continue
+    fi
+    if verify_pid_matches_identity "$_pid" "$_exe" "$_start"; then
+      STOP_PIDS+=("$_pid")
+    else
+      kill -0 "$_pid" 2>/dev/null && UNVERIFIED_LIVE+=("$_pid")
+    fi
+  done
+
+  if ((${#UNVERIFIED_LIVE[@]} > 0)); then
+    {
+      echo "error: ${SCRIPT_TAG} stop: PID(s) ${UNVERIFIED_LIVE[*]} are still RUNNING but could not be identity-verified."
+      echo "error: ${SCRIPT_TAG} Refusing to report a successful stop: the pidfile is retained at ${pidfile}."
+      echo "error: ${SCRIPT_TAG} Releasing this domain's devices now would detach them from a live process."
+      echo "error: ${SCRIPT_TAG} Common cause: ${DOMAIN_RESOLVED_STOP} was upgraded/replaced while the domain ran"
+      echo "error: ${SCRIPT_TAG} (then /proc/PID/exe reads '<path> (deleted)'). Inspect and stop them manually:"
+      echo "error: ${SCRIPT_TAG}   ps -o pid,stat,lstart,cmd -p ${UNVERIFIED_LIVE[*]}"
+      echo "error: ${SCRIPT_TAG}   kill ${UNVERIFIED_LIVE[*]}      # then re-run this stop"
+      echo "error: ${SCRIPT_TAG} Or, if you are certain, force it: sudo $0 stop --log-dir ${LOG_RESOLVED} --force"
+    } >&2
+    exit 1
+  fi
+
+  if ((${#STOP_PIDS[@]} == 0)); then
+    warn "stop: no verified PIDs to stop (pidfile empty or all entries refer to processes that are gone)"
+    rm -f "$pidfile"
+    return 0
+  fi
+
+  log_step "stop: sending SIGTERM to verified PIDs: ${STOP_PIDS[*]}"
+  local pid
+  for pid in "${STOP_PIDS[@]}"; do
+    kill_one_pid "$pid"
+  done
+
+  local waited=0
+  while ((waited < STOP_WAIT_SEC)); do
+    local any=0
+    for pid in "${STOP_PIDS[@]}"; do
+      kill -0 "$pid" 2>/dev/null && any=1
+    done
+    ((any == 0)) && break
+    sleep 1
+    ((waited++)) || true
+  done
+
+  for pid in "${STOP_PIDS[@]}"; do
+    if kill -0 "$pid" 2>/dev/null; then
+      warn "stop: PID $pid still alive after ${STOP_WAIT_SEC}s; sending SIGKILL"
+      kill_one_pid_force "$pid"
+    fi
+  done
+
+  # SIGKILL is not instantaneous, and is not always sufficient: a task wedged in
+  # uninterruptible sleep (e.g. blocked in the driver on a stuck device) survives
+  # it. Confirm every process is really gone before declaring success -- removing
+  # the pidfile while a server still runs would let the orchestrator believe the
+  # domain stopped and release its drives out from under a live process.
+  local kill_waited=0
+  while ((kill_waited < STOP_KILL_WAIT_SEC)); do
+    local still=0
+    for pid in "${STOP_PIDS[@]}"; do
+      kill -0 "$pid" 2>/dev/null && still=1
+    done
+    ((still == 0)) && break
+    sleep 1
+    ((kill_waited++)) || true
+  done
+
+  declare -a SURVIVORS=()
+  for pid in "${STOP_PIDS[@]}"; do
+    kill -0 "$pid" 2>/dev/null && SURVIVORS+=("$pid")
+  done
+
+  if ((${#SURVIVORS[@]} > 0)); then
+    {
+      echo "error: ${SCRIPT_TAG} stop: PID(s) ${SURVIVORS[*]} are STILL ALIVE after SIGKILL + ${STOP_KILL_WAIT_SEC}s."
+      echo "error: ${SCRIPT_TAG} The pidfile is retained so a retry can target them: ${pidfile}"
+      echo "error: ${SCRIPT_TAG} NOT reporting success: the domain's devices must not be released while it runs."
+      echo "error: ${SCRIPT_TAG} Investigate (a process in uninterruptible D state usually means a stuck device):"
+      echo "error: ${SCRIPT_TAG}   ps -o pid,stat,wchan:32,cmd -p ${SURVIVORS[*]}"
+      echo "error: ${SCRIPT_TAG} Then re-run: sudo $0 stop --log-dir ${LOG_RESOLVED}"
+    } >&2
+    exit 1
+  fi
+
+  rm -f "$pidfile"
+  log_step "stop: done (pidfile removed)."
+}
+
+main() {
+  [[ $# -ge 1 ]] || {
+    usage >&2
+    die "missing subcommand (launch|stop)"
+  }
+
+  local sub="$1"
+  shift
+
+  case "$sub" in
+  launch) cmd_launch "$@" ;;
+  stop) cmd_stop "$@" ;;
+  -h | --help)
+    usage
+    exit 0
+    ;;
+  *)
+    die "unknown subcommand: $sub (expected launch or stop)"
+    ;;
+  esac
+}
+
+main "$@"

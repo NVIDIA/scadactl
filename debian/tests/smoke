@@ -1,0 +1,8 @@
+#!/bin/sh
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+set -eu
+
+scadactl --version
+scadactl --help >/dev/null
+manage-scada-domains --help >/dev/null

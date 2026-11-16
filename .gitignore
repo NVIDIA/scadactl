@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+build/
+dist/
+.pytest_cache/
+
+# Debian package build output
+.debhelper/
+debian/.debhelper/
+debian/debhelper-build-stamp
+debian/files
+debian/scadactl/
+debian/*.debhelper
+debian/*.debhelper.log
+debian/*.substvars

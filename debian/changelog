@@ -1,0 +1,5 @@
+scadactl (0.6.0-1) unstable; urgency=medium
+
+  * Initial Debian packaging.
+
+ -- NVIDIA scadactl Maintainers <noreply@nvidia.com>  Tue, 22 Sep 2026 16:00:00 +0000

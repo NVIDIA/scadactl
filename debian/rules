@@ -1,0 +1,11 @@
+#!/usr/bin/make -f
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+%:
+	dh $@ --buildsystem=none
+
+override_dh_auto_test:
+ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
+	PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q
+endif

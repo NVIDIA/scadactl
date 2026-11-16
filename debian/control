@@ -1,0 +1,30 @@
+Source: scadactl
+Section: admin
+Priority: optional
+Maintainer: NVIDIA scadactl Maintainers <noreply@nvidia.com>
+Build-Depends:
+ debhelper-compat (= 13),
+ python3,
+ python3-pytest,
+ python3-yaml,
+Standards-Version: 4.6.2
+Rules-Requires-Root: no
+
+Package: scadactl
+Architecture: all
+Depends:
+ pciutils,
+ procps,
+ psmisc,
+ python3,
+ python3-yaml,
+ util-linux,
+ ${misc:Depends},
+Recommends:
+ nvme-cli,
+ python3-pynvml,
+Description: control plane for SCADA GPU and NVMe domains
+ Command-line control plane for inventory, configuration, validation,
+ reconciliation, domain launch, and client environment selection on SCADA
+ GPU and NVMe hosts. Storage drivers and domain-server implementations are
+ installed separately.

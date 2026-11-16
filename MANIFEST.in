@@ -1,0 +1,22 @@
+include CHANGELOG.md
+include CODE_OF_CONDUCT.md
+include CONTRIBUTING.md
+include DEPENDENCIES.md
+include GOVERNANCE.md
+include MAINTAINERS.md
+include RELEASING.md
+include SECURITY.md
+include SUPPORT.md
+include THIRD_PARTY_NOTICES.md
+include .github/CODEOWNERS
+include packaging/README.md
+include packaging/scadactl
+include scripts/manage-scada-domains
+recursive-include .github *.md *.yml
+recursive-include debian *
+
+# Exclude publication tooling from distribution packages.
+exclude .gitlab-ci.yml
+exclude github-export.toml
+prune tools
+exclude docs/github-export.md
